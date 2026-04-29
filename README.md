@@ -27,4 +27,5 @@ FastAPI + PostgreSQL API for Smart Copra Dryer telemetry.
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+python -c "import base64; print(base64.b64encode(open('firebase-service-account.json','rb').read()).decode())"
 uvicorn main:app --host 0.0.0.0 --port 3000 --reload
