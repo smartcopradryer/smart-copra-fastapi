@@ -216,3 +216,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+firebase-service-account.json

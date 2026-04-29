@@ -4,6 +4,7 @@
         |-- sync-to-huggingface.yml
 |-- .gitignore
 |-- Dockerfile
+|-- firebase-service-account.json
 |-- LICENSE
 |-- main.py
 |-- README.md
