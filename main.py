@@ -1,7 +1,9 @@
 import os
-from datetime import datetime
+import json
+import base64
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -23,7 +25,7 @@ load_dotenv()
 # =========================================================
 app = FastAPI(
     title="Smart Copra Dryer API",
-    version="2.0.0",
+    version="2.2.0",
     description="FastAPI + Firebase Realtime Database API for Smart Copra Dryer telemetry.",
 )
 
@@ -58,9 +60,15 @@ app.add_middleware(
 # =========================================================
 # HELPERS
 # =========================================================
-def get_timezone() -> ZoneInfo:
+def get_timezone():
     timezone_name = os.getenv("APP_TIMEZONE", "Asia/Manila")
-    return ZoneInfo(timezone_name)
+
+    try:
+        return ZoneInfo(timezone_name)
+
+    except ZoneInfoNotFoundError:
+        print(f"[TIMEZONE] {timezone_name} not found. Falling back to UTC+08:00.")
+        return timezone(timedelta(hours=8))
 
 
 def now_iso() -> str:
@@ -72,16 +80,16 @@ def sanitize_firebase_key(value: str) -> str:
     Firebase Realtime Database keys cannot contain:
     . # $ / [ ]
 
-    This keeps device_id safe as a Firebase path key.
+    This converts invalid characters to underscore.
+    Example:
+    dryer/001 -> dryer_001
     """
     if not value:
         return value
 
-    invalid_chars = [".", "#", "$", "/", "[", "]"]
-
     sanitized = value.strip()
 
-    for char in invalid_chars:
+    for char in [".", "#", "$", "/", "[", "]"]:
         sanitized = sanitized.replace(char, "_")
 
     return sanitized
@@ -110,7 +118,7 @@ def get_ref(path: str):
             detail={
                 "success": False,
                 "message": "Firebase is not initialized",
-                "hint": "Check FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT_PATH.",
+                "hint": "Check FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT_JSON_B64.",
             },
         )
 
@@ -121,38 +129,94 @@ def get_ref(path: str):
 # FIREBASE INIT
 # =========================================================
 def initialize_firebase():
+    """
+    Uses Firebase service account from environment variable.
+
+    Preferred:
+    FIREBASE_SERVICE_ACCOUNT_JSON_B64=base64_encoded_service_account_json
+
+    Optional fallback:
+    FIREBASE_SERVICE_ACCOUNT_JSON=one_line_json
+    """
     if firebase_ready():
         return
 
     database_url = os.getenv("FIREBASE_DATABASE_URL")
-    service_account_path = os.getenv(
-        "FIREBASE_SERVICE_ACCOUNT_PATH",
-        "firebase-service-account.json",
-    )
+    service_account_json_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON_B64")
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
     if not database_url:
         raise RuntimeError("FIREBASE_DATABASE_URL is missing in .env")
 
-    if not os.path.exists(service_account_path):
+    try:
+        if service_account_json_b64:
+            print("[FIREBASE] Using service account from FIREBASE_SERVICE_ACCOUNT_JSON_B64")
+
+            decoded_json = base64.b64decode(service_account_json_b64).decode("utf-8")
+            service_account_info = json.loads(decoded_json)
+
+        elif service_account_json:
+            print("[FIREBASE] Using service account from FIREBASE_SERVICE_ACCOUNT_JSON")
+
+            service_account_info = json.loads(service_account_json)
+
+        else:
+            raise RuntimeError(
+                "Missing Firebase credentials. "
+                "Set FIREBASE_SERVICE_ACCOUNT_JSON_B64 in .env."
+            )
+
+    except Exception as error:
         raise RuntimeError(
-            f"Firebase service account file not found: {service_account_path}"
+            f"Failed to parse Firebase service account from environment variable. "
+            f"Error: {error}"
         )
 
-    cred = credentials.Certificate(service_account_path)
+    required_keys = [
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "token_uri",
+    ]
 
-    firebase_admin.initialize_app(
-        cred,
-        {
-            "databaseURL": database_url,
-        },
-    )
+    missing_keys = [
+        key for key in required_keys
+        if key not in service_account_info or not service_account_info.get(key)
+    ]
+
+    if missing_keys:
+        raise RuntimeError(
+            f"Firebase service account is missing required keys: {missing_keys}"
+        )
+
+    private_key = service_account_info.get("private_key", "")
+
+    # Supports either escaped \\n or real newlines.
+    if "\\n" in private_key:
+        service_account_info["private_key"] = private_key.replace("\\n", "\n")
+
+    try:
+        cred = credentials.Certificate(service_account_info)
+
+        firebase_admin.initialize_app(
+            cred,
+            {
+                "databaseURL": database_url,
+            },
+        )
+
+        print("[FIREBASE] Realtime Database connected")
+
+    except Exception as error:
+        raise RuntimeError(f"Firebase initialization failed: {error}")
 
 
 @app.on_event("startup")
 async def startup():
     try:
         initialize_firebase()
-        print("[FIREBASE] Realtime Database connected")
 
     except Exception as error:
         print("[FIREBASE] Initialization failed:", error)
@@ -207,8 +271,7 @@ async def health():
         if not firebase_ready():
             raise RuntimeError("Firebase app is not initialized")
 
-        # Simple read test
-        connected_test = get_ref("/").get(shallow=True)
+        root_keys = get_ref("/").get(shallow=True)
 
         return {
             "success": True,
@@ -217,7 +280,7 @@ async def health():
             "database_type": "firebase_realtime_database",
             "server_time": now_iso(),
             "firebase_ready": True,
-            "root_keys": connected_test if connected_test else {},
+            "root_keys": root_keys if root_keys else {},
         }
 
     except Exception as error:
@@ -249,10 +312,8 @@ async def save_telemetry(payload: TelemetryPayload):
         device_key = sanitize_firebase_key(original_device_id)
         timestamp = now_iso()
 
-        devices_ref = get_ref("devices")
         device_ref = get_ref(f"devices/{device_key}")
         telemetry_logs_ref = get_ref("telemetry_logs")
-        device_logs_ref = get_ref(f"device_logs/{device_key}")
 
         existing_device = device_ref.get()
 
@@ -296,7 +357,6 @@ async def save_telemetry(payload: TelemetryPayload):
             "created_at": timestamp,
         }
 
-        # Multi-location update is closer to a transaction-style write in Firebase RTDB.
         updates = {
             f"devices/{device_key}": device_data,
             f"telemetry_logs/{log_id}": log_data,
@@ -313,6 +373,9 @@ async def save_telemetry(payload: TelemetryPayload):
                 "log": log_data,
             },
         }
+
+    except HTTPException:
+        raise
 
     except Exception as error:
         print("[POST /api/telemetry] Error:", error)
@@ -414,7 +477,6 @@ async def get_device_history(
 ):
     try:
         device_key = sanitize_firebase_key(device_id)
-
         device_log_index = get_ref(f"device_logs/{device_key}").get()
 
         if not device_log_index:
@@ -486,38 +548,6 @@ async def get_logs(
 
     except Exception as error:
         print("[GET logs] Error:", error)
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "message": "Internal server error",
-                "error": str(error),
-            },
-        )
-
-
-# =========================================================
-# OPTIONAL: CLEAR TEST DATA
-# =========================================================
-@app.delete("/api/debug/clear-data")
-async def clear_data():
-    """
-    For development only.
-    Remove this route in production if not needed.
-    """
-    try:
-        get_ref("devices").delete()
-        get_ref("telemetry_logs").delete()
-        get_ref("device_logs").delete()
-
-        return {
-            "success": True,
-            "message": "Firebase test data cleared",
-        }
-
-    except Exception as error:
-        print("[DELETE clear-data] Error:", error)
 
         raise HTTPException(
             status_code=500,
