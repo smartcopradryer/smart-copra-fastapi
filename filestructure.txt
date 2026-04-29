@@ -1,0 +1,13 @@
+|-- .env
+|-- .github
+    |-- workflows
+        |-- sync-to-huggingface.yml
+|-- .gitignore
+|-- Dockerfile
+|-- LICENSE
+|-- main.py
+|-- README.md
+|-- requirements.txt
+|-- schema.sql
+|-- __pycache__
+    |-- main.cpython-310.pyc

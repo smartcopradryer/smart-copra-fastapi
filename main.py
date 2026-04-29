@@ -1,42 +1,89 @@
-# main.py
-
 import os
 from typing import Optional, Any
+from urllib.parse import quote_plus
 
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
+# =========================================================
+# LOAD ENV
+# =========================================================
 load_dotenv()
 
+
+# =========================================================
+# APP
+# =========================================================
 app = FastAPI(
     title="Smart Copra Dryer API",
     version="1.0.0",
+    description="FastAPI + PostgreSQL API for Smart Copra Dryer telemetry.",
 )
 
 
-# ===============================
+# =========================================================
 # CORS
-# ===============================
+# =========================================================
+def get_cors_origins():
+    """
+    CORS_ORIGINS can be:
+    CORS_ORIGINS=*
+    or
+    CORS_ORIGINS=http://localhost:4200,https://your-app.vercel.app
+    """
+    origins = os.getenv("CORS_ORIGINS", "*")
+
+    if origins.strip() == "*":
+        return ["*"]
+
+    return [origin.strip() for origin in origins.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development. Restrict this in production.
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ===============================
+# =========================================================
 # DATABASE
-# ===============================
+# =========================================================
 db_pool: Optional[asyncpg.Pool] = None
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in ["true", "1", "yes", "y", "on"]
+
+
 def get_database_url() -> str:
+    """
+    Supports two deployment styles:
+
+    Option A:
+    DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DB_NAME?ssl=require
+
+    Option B:
+    DB_USER=neondb_owner
+    DB_HOST=your-neon-host
+    DB_NAME=smartcopradryerdb
+    DB_PASSWORD=your-password
+    DB_PORT=5432
+    DB_SSL=true
+    """
+
     database_url = os.getenv("DATABASE_URL")
 
     if database_url:
@@ -44,18 +91,31 @@ def get_database_url() -> str:
 
     host = os.getenv("DB_HOST", "localhost")
     port = os.getenv("DB_PORT", "5432")
-    database = os.getenv("DB_NAME", "smart_copra_dryer")
+    database = os.getenv("DB_NAME", "smartcopradryerdb")
     user = os.getenv("DB_USER", "postgres")
     password = os.getenv("DB_PASSWORD", "")
+    db_ssl = env_bool("DB_SSL", False)
 
-    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    encoded_user = quote_plus(user)
+    encoded_password = quote_plus(password)
+
+    url = f"postgresql://{encoded_user}:{encoded_password}@{host}:{port}/{database}"
+
+    if db_ssl:
+        url += "?ssl=require"
+
+    return url
 
 
 async def get_pool() -> asyncpg.Pool:
     if db_pool is None:
         raise HTTPException(
             status_code=500,
-            detail="Database pool is not initialized",
+            detail={
+                "success": False,
+                "message": "Database pool is not initialized",
+                "hint": "Check DATABASE_URL or DB_HOST/DB_USER/DB_PASSWORD settings.",
+            },
         )
 
     return db_pool
@@ -81,13 +141,19 @@ async def startup():
 
     database_url = get_database_url()
 
-    db_pool = await asyncpg.create_pool(
-        dsn=database_url,
-        min_size=1,
-        max_size=10,
-    )
+    try:
+        db_pool = await asyncpg.create_pool(
+            dsn=database_url,
+            min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+            max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")),
+            command_timeout=int(os.getenv("DB_COMMAND_TIMEOUT", "30")),
+        )
 
-    print("[DB] PostgreSQL connected")
+        print("[DB] PostgreSQL connected")
+
+    except Exception as error:
+        print("[DB] PostgreSQL connection failed:", error)
+        db_pool = None
 
 
 @app.on_event("shutdown")
@@ -99,9 +165,9 @@ async def shutdown():
         print("[DB] PostgreSQL disconnected")
 
 
-# ===============================
+# =========================================================
 # MODELS
-# ===============================
+# =========================================================
 class SessionPayload(BaseModel):
     active: Optional[bool] = None
     duration_ms: Optional[int] = Field(default=None, alias="durationMs")
@@ -123,14 +189,16 @@ class TelemetryPayload(BaseModel):
         populate_by_name = True
 
 
-# ===============================
+# =========================================================
 # ROUTES
-# ===============================
+# =========================================================
 @app.get("/")
 async def root():
     return {
         "success": True,
         "message": "Smart Copra Dryer API is running",
+        "docs": "/docs",
+        "health": "/health",
     }
 
 
@@ -145,6 +213,7 @@ async def health():
         return {
             "success": True,
             "message": "OK",
+            "database": "connected",
             "serverTime": row["now"],
         }
 
@@ -261,6 +330,38 @@ async def save_telemetry(payload: TelemetryPayload):
         )
 
 
+@app.get("/api/devices")
+async def get_devices():
+    try:
+        pool = await get_pool()
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM dbo.devices
+                ORDER BY updated_at DESC;
+                """
+            )
+
+        return {
+            "success": True,
+            "data": serialize_record(rows),
+        }
+
+    except Exception as error:
+        print("[GET /api/devices] Error:", error)
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "message": "Internal server error",
+                "error": str(error),
+            },
+        )
+
+
 @app.get("/api/devices/{device_id}/latest")
 async def get_latest_device(device_id: str):
     try:
@@ -346,38 +447,6 @@ async def get_device_history(
         )
 
 
-@app.get("/api/devices")
-async def get_devices():
-    try:
-        pool = await get_pool()
-
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT *
-                FROM dbo.devices
-                ORDER BY updated_at DESC;
-                """
-            )
-
-        return {
-            "success": True,
-            "data": serialize_record(rows),
-        }
-
-    except Exception as error:
-        print("[GET dbo.devices] Error:", error)
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "message": "Internal server error",
-                "error": str(error),
-            },
-        )
-
-
 @app.get("/api/logs")
 async def get_logs(
     limit: int = Query(default=100, ge=1, le=2000),
@@ -414,12 +483,16 @@ async def get_logs(
         )
 
 
-# ===============================
+# =========================================================
 # 404 HANDLER
-# ===============================
+# =========================================================
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
-    return {
-        "success": False,
-        "message": "Route not found",
-    }
+    return JSONResponse(
+        status_code=404,
+        content={
+            "success": False,
+            "message": "Route not found",
+            "path": str(request.url.path),
+        },
+    )
