@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import firebase_admin
 from firebase_admin import credentials, db
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -25,8 +25,8 @@ load_dotenv()
 # =========================================================
 app = FastAPI(
     title="Smart Copra Dryer API",
-    version="2.2.0",
-    description="FastAPI + Firebase Realtime Database API for Smart Copra Dryer telemetry.",
+    version="2.3.0",
+    description="FastAPI + Firebase Realtime Database + WebSocket API.",
 )
 
 
@@ -34,12 +34,6 @@ app = FastAPI(
 # CORS
 # =========================================================
 def get_cors_origins():
-    """
-    CORS_ORIGINS can be:
-    CORS_ORIGINS=*
-    or
-    CORS_ORIGINS=http://localhost:4200,https://your-app.vercel.app
-    """
     origins = os.getenv("CORS_ORIGINS", "*")
 
     if origins.strip() == "*":
@@ -76,14 +70,6 @@ def now_iso() -> str:
 
 
 def sanitize_firebase_key(value: str) -> str:
-    """
-    Firebase Realtime Database keys cannot contain:
-    . # $ / [ ]
-
-    This converts invalid characters to underscore.
-    Example:
-    dryer/001 -> dryer_001
-    """
     if not value:
         return value
 
@@ -126,18 +112,64 @@ def get_ref(path: str):
 
 
 # =========================================================
+# WEBSOCKET MANAGER
+# =========================================================
+class WebSocketManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+        await websocket.send_json({
+            "type": "connected",
+            "message": "Connected to Smart Copra Dryer WebSocket",
+            "server_time": now_iso(),
+            "clients": len(self.active_connections),
+        })
+
+        print(f"[WS] Client connected. Total: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+        print(f"[WS] Client disconnected. Total: {len(self.active_connections)}")
+
+    async def send_personal_message(self, websocket: WebSocket, message: Dict[str, Any]):
+        try:
+            await websocket.send_json(message)
+
+        except Exception as error:
+            print("[WS] Personal send failed:", error)
+            self.disconnect(websocket)
+
+    async def broadcast(self, message: Dict[str, Any]):
+        if not self.active_connections:
+            return
+
+        disconnected_clients = []
+
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+
+            except Exception as error:
+                print("[WS] Broadcast failed:", error)
+                disconnected_clients.append(connection)
+
+        for connection in disconnected_clients:
+            self.disconnect(connection)
+
+
+ws_manager = WebSocketManager()
+
+
+# =========================================================
 # FIREBASE INIT
 # =========================================================
 def initialize_firebase():
-    """
-    Uses Firebase service account from environment variable.
-
-    Preferred:
-    FIREBASE_SERVICE_ACCOUNT_JSON_B64=base64_encoded_service_account_json
-
-    Optional fallback:
-    FIREBASE_SERVICE_ACCOUNT_JSON=one_line_json
-    """
     if firebase_ready():
         return
 
@@ -193,7 +225,6 @@ def initialize_firebase():
 
     private_key = service_account_info.get("private_key", "")
 
-    # Supports either escaped \\n or real newlines.
     if "\\n" in private_key:
         service_account_info["private_key"] = private_key.replace("\\n", "\n")
 
@@ -260,6 +291,7 @@ async def root():
         "success": True,
         "message": "Smart Copra Dryer API is running",
         "database": "firebase_realtime_database",
+        "websocket": "/ws",
         "docs": "/docs",
         "health": "/health",
     }
@@ -280,6 +312,7 @@ async def health():
             "database_type": "firebase_realtime_database",
             "server_time": now_iso(),
             "firebase_ready": True,
+            "websocket_clients": len(ws_manager.active_connections),
             "root_keys": root_keys if root_keys else {},
         }
 
@@ -294,6 +327,65 @@ async def health():
                 "error": str(error),
             },
         )
+
+
+@app.get("/api/ws-info")
+async def websocket_info(request: Request):
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    host = request.headers.get("host", "localhost:3000")
+
+    return {
+        "success": True,
+        "websocket_path": "/ws",
+        "websocket_url": f"{scheme}://{host}/ws",
+        "clients": len(ws_manager.active_connections),
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            try:
+                parsed = json.loads(data)
+
+            except Exception:
+                parsed = {
+                    "type": "message",
+                    "message": data,
+                }
+
+            message_type = parsed.get("type")
+
+            if message_type == "ping":
+                await ws_manager.send_personal_message(
+                    websocket,
+                    {
+                        "type": "pong",
+                        "server_time": now_iso(),
+                    },
+                )
+
+            else:
+                await ws_manager.send_personal_message(
+                    websocket,
+                    {
+                        "type": "echo",
+                        "received": parsed,
+                        "server_time": now_iso(),
+                    },
+                )
+
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+
+    except Exception as error:
+        print("[WS] Error:", error)
+        ws_manager.disconnect(websocket)
 
 
 @app.post("/api/telemetry", status_code=201)
@@ -365,9 +457,23 @@ async def save_telemetry(payload: TelemetryPayload):
 
         get_ref("/").update(updates)
 
+        ws_payload = {
+            "type": "telemetry_created",
+            "message": "New telemetry saved",
+            "server_time": now_iso(),
+            "data": {
+                "device": device_data,
+                "log": log_data,
+            },
+        }
+
+        await ws_manager.broadcast(ws_payload)
+
         return {
             "success": True,
             "message": "Telemetry saved successfully",
+            "websocket_broadcasted": True,
+            "websocket_clients": len(ws_manager.active_connections),
             "data": {
                 "device": device_data,
                 "log": log_data,
