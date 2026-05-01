@@ -99,6 +99,57 @@ class CommandResultPayload(BaseModel):
         populate_by_name = True
 
 
+class UpdateProfilePayload(BaseModel):
+    display_name: str = Field(..., alias="displayName")
+
+    class Config:
+        populate_by_name = True
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def _effective_display_name(user: Dict[str, Any]) -> Optional[str]:
+    return (
+        user.get("custom_display_name")
+        or user.get("display_name")
+        or user.get("email")
+    )
+
+
+def _format_user_response(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "userId": user.get("user_id"),
+        "userKey": user.get("user_key"),
+        "firebaseUid": user.get("firebase_uid"),
+        "email": user.get("email"),
+        "emailVerified": user.get("email_verified"),
+        "displayName": _effective_display_name(user),
+        "googleDisplayName": user.get("display_name"),
+        "customDisplayName": user.get("custom_display_name"),
+        "photoUrl": user.get("photo_url"),
+        "provider": user.get("provider"),
+        "createdAt": user.get("created_at"),
+        "updatedAt": user.get("updated_at"),
+        "lastLoginAt": user.get("last_login_at"),
+    }
+
+
+def _get_fresh_user(app_user: Dict[str, Any]) -> Dict[str, Any]:
+    user_key = app_user.get("user_key")
+
+    if not user_key:
+        return app_user
+
+    saved_user = get_ref(f"users/{user_key}").get()
+
+    if isinstance(saved_user, dict):
+        saved_user["user_key"] = user_key
+        return saved_user
+
+    return app_user
+
+
 # =========================================================
 # BASIC ROUTES
 # =========================================================
@@ -114,6 +165,7 @@ async def root():
         "auth": {
             "sync_google_user": "/api/auth/google/sync",
             "me": "/api/auth/me",
+            "update_profile": "/api/users/me/profile",
         },
         "pairing": {
             "register_machine": "/api/machines/register",
@@ -187,22 +239,12 @@ async def websocket_info(request: Request):
 async def sync_google_user(
     app_user: Dict[str, Any] = Depends(get_current_app_user),
 ):
+    fresh_user = _get_fresh_user(app_user)
+
     return {
         "success": True,
         "message": "User synced successfully",
-        "data": {
-            "userId": app_user.get("user_id"),
-            "userKey": app_user.get("user_key"),
-            "firebaseUid": app_user.get("firebase_uid"),
-            "email": app_user.get("email"),
-            "emailVerified": app_user.get("email_verified"),
-            "displayName": app_user.get("display_name"),
-            "photoUrl": app_user.get("photo_url"),
-            "provider": app_user.get("provider"),
-            "createdAt": app_user.get("created_at"),
-            "updatedAt": app_user.get("updated_at"),
-            "lastLoginAt": app_user.get("last_login_at"),
-        },
+        "data": _format_user_response(fresh_user),
     }
 
 
@@ -210,25 +252,100 @@ async def sync_google_user(
 async def get_me(
     app_user: Dict[str, Any] = Depends(get_current_app_user),
 ):
-    user_key = app_user.get("user_key")
+    fresh_user = _get_fresh_user(app_user)
+    user_key = fresh_user.get("user_key")
     pairing = get_ref(f"user_pairings/{user_key}").get() if user_key else None
 
     return {
         "success": True,
         "data": {
-            "user": {
-                "userId": app_user.get("user_id"),
-                "userKey": app_user.get("user_key"),
-                "firebaseUid": app_user.get("firebase_uid"),
-                "email": app_user.get("email"),
-                "emailVerified": app_user.get("email_verified"),
-                "displayName": app_user.get("display_name"),
-                "photoUrl": app_user.get("photo_url"),
-                "provider": app_user.get("provider"),
-            },
+            "user": _format_user_response(fresh_user),
             "pairing": pairing,
         },
     }
+
+
+@router.put("/api/users/me/profile")
+async def update_my_profile(
+    payload: UpdateProfilePayload,
+    app_user: Dict[str, Any] = Depends(get_current_app_user),
+):
+    try:
+        display_name = payload.display_name.strip()
+
+        if len(display_name) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "message": "Name must be at least 2 characters.",
+                },
+            )
+
+        if len(display_name) > 80:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "message": "Name must be 80 characters or less.",
+                },
+            )
+
+        user_key = app_user.get("user_key")
+
+        if not user_key:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "success": False,
+                    "message": "User key missing.",
+                },
+            )
+
+        timestamp = now_iso()
+
+        updates = {
+            f"users/{user_key}/custom_display_name": display_name,
+            f"users/{user_key}/updated_at": timestamp,
+        }
+
+        get_ref("/").update(updates)
+
+        fresh_user = _get_fresh_user(app_user)
+        fresh_user["custom_display_name"] = display_name
+        fresh_user["updated_at"] = timestamp
+
+        await ws_manager.broadcast({
+            "type": "user_profile_updated",
+            "message": "User profile updated",
+            "server_time": now_iso(),
+            "data": {
+                "userId": fresh_user.get("user_id"),
+                "userKey": fresh_user.get("user_key"),
+                "displayName": display_name,
+            },
+        })
+
+        return {
+            "success": True,
+            "message": "Profile updated successfully",
+            "data": _format_user_response(fresh_user),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        print("[PUT /api/users/me/profile] Error:", error)
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "message": "Internal server error",
+                "error": str(error),
+            },
+        )
 
 
 # =========================================================
@@ -362,7 +479,7 @@ async def unpair_machine(
 
         return {
             "success": True,
-            "message": "Machine unpaired successfully",
+            "message": "Machine disconnected successfully",
             "data": data,
             "websocket_broadcasted": True,
         }
