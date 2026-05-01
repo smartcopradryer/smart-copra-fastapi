@@ -3,11 +3,17 @@
     |-- workflows
         |-- sync-to-huggingface.yml
 |-- .gitignore
+|-- api.py
+|-- config.py
 |-- Dockerfile
 |-- firebase-service-account.json
 |-- LICENSE
 |-- main.py
 |-- README.md
 |-- requirements.txt
+|-- services.py
 |-- __pycache__
+    |-- api.cpython-310.pyc
+    |-- config.cpython-310.pyc
     |-- main.cpython-310.pyc
+    |-- services.cpython-310.pyc
