@@ -9,6 +9,5 @@
 |-- main.py
 |-- README.md
 |-- requirements.txt
-|-- schema.sql
 |-- __pycache__
     |-- main.cpython-310.pyc
