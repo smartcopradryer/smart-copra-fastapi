@@ -23,10 +23,10 @@ load_dotenv()
 # ENV / SETTINGS
 # =========================================================
 APP_TITLE = "Smart Copra Dryer API"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 APP_DESCRIPTION = (
     "FastAPI + Firebase Realtime Database + WebSocket + Google Auth "
-    "+ Dryer Pairing + Machine Command API."
+    "+ Dryer Pairing + Machine Command API + Session History."
 )
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Manila")
@@ -36,11 +36,16 @@ PAIRING_SECRET = os.getenv(
     "PAIRING_SECRET",
     "dev-smart-copra-dryer-pairing-secret",
 )
+
 APP_PAIR_URL = os.getenv("APP_PAIR_URL", "")
 PAIRING_REQUIRE_MODE = os.getenv("PAIRING_REQUIRE_MODE", "false")
 
 FIREBASE_TOKEN_CLOCK_SKEW_SECONDS = int(
     os.getenv("FIREBASE_TOKEN_CLOCK_SKEW_SECONDS", "10")
+)
+
+DRYER_DEFAULT_TARGET_TEMPERATURE = float(
+    os.getenv("DRYER_DEFAULT_TARGET_TEMPERATURE", "60")
 )
 
 

@@ -9,6 +9,7 @@ from fastapi import HTTPException, Header, Depends, WebSocket
 from config import (
     FIREBASE_TOKEN_CLOCK_SKEW_SECONDS,
     PAIRING_REQUIRE_MODE,
+    DRYER_DEFAULT_TARGET_TEMPERATURE,
     build_qr_payload,
     env_bool,
     generate_pair_code,
@@ -788,9 +789,18 @@ class CommandService:
             elapsed_minutes = duration_minutes
             remaining_minutes = 0
 
-        duration_ms = CommandService._safe_int(machine.get("session_duration_ms"), duration_minutes * 60 * 1000)
-        remaining_ms = CommandService._safe_int(machine.get("session_remaining_ms"), remaining_minutes * 60 * 1000)
-        elapsed_ms = CommandService._safe_int(machine.get("session_elapsed_ms"), elapsed_minutes * 60 * 1000)
+        duration_ms = CommandService._safe_int(
+            machine.get("session_duration_ms"),
+            duration_minutes * 60 * 1000,
+        )
+        remaining_ms = CommandService._safe_int(
+            machine.get("session_remaining_ms"),
+            remaining_minutes * 60 * 1000,
+        )
+        elapsed_ms = CommandService._safe_int(
+            machine.get("session_elapsed_ms"),
+            elapsed_minutes * 60 * 1000,
+        )
 
         if final_status.upper() in ["COMPLETED", "TIME_COMPLETED"]:
             elapsed_ms = duration_ms
@@ -845,10 +855,11 @@ class CommandService:
 
         session_id = history_record["session_id"]
         timestamp = now_iso()
+        owner_user_key = machine.get("owner_user_key") or "unknown_user"
 
         updates = {
             f"session_history/{machine_key}/{session_id}": history_record,
-            f"session_history_by_user/{machine.get('owner_user_key')}/{session_id}": {
+            f"session_history_by_user/{owner_user_key}/{session_id}": {
                 "machine_key": machine_key,
                 "machine_id": machine_id,
                 "session_id": session_id,
@@ -907,15 +918,15 @@ class CommandService:
         machine_key = owned["machine_key"]
         machine = owned["machine"] or {}
 
-        target_temperature = float(payload.target_temperature)
+        target_temperature = float(DRYER_DEFAULT_TARGET_TEMPERATURE)
         duration_minutes = int(payload.duration_minutes)
 
         if target_temperature < 30 or target_temperature > 120:
             raise HTTPException(
-                status_code=400,
+                status_code=500,
                 detail={
                     "success": False,
-                    "message": "Target temperature must be between 30 and 120 °C",
+                    "message": "Backend default target temperature is invalid. Check DRYER_DEFAULT_TARGET_TEMPERATURE.",
                 },
             )
 

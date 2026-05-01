@@ -84,7 +84,6 @@ class PairingModePayload(BaseModel):
 
 
 class StartSessionCommandPayload(BaseModel):
-    target_temperature: float = Field(..., alias="targetTemperature")
     duration_minutes: int = Field(..., alias="durationMinutes")
 
     class Config:
@@ -575,11 +574,6 @@ async def get_pending_machine_commands(
     machine_id: str,
     limit: int = Query(default=1, ge=1, le=10),
 ):
-    """
-    Dryer firmware can poll this endpoint.
-
-    Later, protect this with a machine API key.
-    """
     try:
         data = CommandService.get_pending_commands(machine_id, limit)
 
@@ -610,11 +604,6 @@ async def post_machine_command_result(
     command_id: str,
     payload: CommandResultPayload,
 ):
-    """
-    Dryer firmware can call this after accepting/completing a command.
-
-    Later, protect this with a machine API key.
-    """
     try:
         data = await CommandService.mark_command_result(
             machine_id,
