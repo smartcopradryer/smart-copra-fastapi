@@ -717,6 +717,34 @@ class CommandService:
         }
 
     @staticmethod
+    def _clear_machine_command_queue(machine_key: str, reason: str = "Dropped because a newer command was queued"):
+        try:
+            queue = get_ref(f"machine_command_queue/{machine_key}").get()
+
+            if not queue:
+                return
+
+            updates = {}
+            timestamp = now_iso()
+
+            for command_id in list(queue.keys()):
+                command = get_ref(f"machine_commands/{command_id}").get()
+
+                if command and command.get("status") == "QUEUED":
+                    updates[f"machine_commands/{command_id}/status"] = "DROPPED"
+                    updates[f"machine_commands/{command_id}/result"] = "DROPPED"
+                    updates[f"machine_commands/{command_id}/message"] = reason
+                    updates[f"machine_commands/{command_id}/updated_at"] = timestamp
+
+                updates[f"machine_command_queue/{machine_key}/{command_id}"] = None
+
+            if updates:
+                get_ref("/").update(updates)
+
+        except Exception as error:
+            print("[COMMAND] Failed to clear old queue:", error)
+
+    @staticmethod
     def _create_command_record(
         machine_id: str,
         machine_key: str,
@@ -724,6 +752,8 @@ class CommandService:
         command: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        CommandService._clear_machine_command_queue(machine_key)
+
         timestamp = now_iso()
         command_ref = get_ref("machine_commands").push()
         command_id = command_ref.key
@@ -1093,13 +1123,8 @@ class CommandService:
 
         updates = {
             f"machines/{machine_key}/latest_status": "PAUSING",
-            f"machines/{machine_key}/session_active": True,
-            f"machines/{machine_key}/session_paused": True,
             f"machines/{machine_key}/updated_at": timestamp,
-
             f"devices/{machine_key}/latest_status": "PAUSING",
-            f"devices/{machine_key}/session_active": True,
-            f"devices/{machine_key}/session_paused": True,
             f"devices/{machine_key}/updated_at": timestamp,
         }
 
@@ -1131,13 +1156,8 @@ class CommandService:
 
         updates = {
             f"machines/{machine_key}/latest_status": "RESUMING",
-            f"machines/{machine_key}/session_active": True,
-            f"machines/{machine_key}/session_paused": False,
             f"machines/{machine_key}/updated_at": timestamp,
-
             f"devices/{machine_key}/latest_status": "RESUMING",
-            f"devices/{machine_key}/session_active": True,
-            f"devices/{machine_key}/session_paused": False,
             f"devices/{machine_key}/updated_at": timestamp,
         }
 
@@ -1156,7 +1176,6 @@ class CommandService:
 
         machine_id = owned["machine_id"]
         machine_key = owned["machine_key"]
-        machine = owned["machine"] or {}
 
         command_data = CommandService._create_command_record(
             machine_id=machine_id,
@@ -1166,40 +1185,23 @@ class CommandService:
             payload={},
         )
 
-        finalize_result = None
+        timestamp = now_iso()
 
-        if CommandService._is_session_in_progress(machine):
-            finalize_result = CommandService._finalize_session(
-                machine_id=machine_id,
-                machine_key=machine_key,
-                machine=machine,
-                final_status="STOPPED",
-                completion_reason="USER_STOPPED",
-            )
+        updates = {
+            f"machines/{machine_key}/latest_status": "STOPPING",
+            f"machines/{machine_key}/updated_at": timestamp,
+            f"devices/{machine_key}/latest_status": "STOPPING",
+            f"devices/{machine_key}/updated_at": timestamp,
+        }
 
-        else:
-            timestamp = now_iso()
-
-            updates = {
-                f"machines/{machine_key}/latest_status": "STOPPING",
-                f"machines/{machine_key}/session_active": False,
-                f"machines/{machine_key}/session_paused": False,
-                f"machines/{machine_key}/updated_at": timestamp,
-
-                f"devices/{machine_key}/latest_status": "STOPPING",
-                f"devices/{machine_key}/session_active": False,
-                f"devices/{machine_key}/session_paused": False,
-                f"devices/{machine_key}/updated_at": timestamp,
-            }
-
-            get_ref("/").update(updates)
+        get_ref("/").update(updates)
 
         await CommandService._broadcast_command(
             command_data,
             "Stop command queued",
         )
 
-        command_data["finalize_result"] = finalize_result
+        command_data["finalize_result"] = None
 
         return command_data
 
