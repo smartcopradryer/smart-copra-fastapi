@@ -4,3 +4,4 @@ python-dotenv
 pydantic
 firebase-admin
 tzdata
+paho-mqtt

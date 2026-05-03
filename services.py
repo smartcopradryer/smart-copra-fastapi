@@ -25,6 +25,8 @@ from config import (
     sort_by_created_at_desc,
 )
 
+from mqtt_service import publish_machine_command
+
 
 # =========================================================
 # WEBSOCKET SERVICE
@@ -654,7 +656,9 @@ class CommandService:
         try:
             if value is None:
                 return default
+
             return int(value)
+
         except Exception:
             return default
 
@@ -663,7 +667,9 @@ class CommandService:
         try:
             if value is None:
                 return default
+
             return float(value)
+
         except Exception:
             return default
 
@@ -741,6 +747,9 @@ class CommandService:
             "result": None,
             "message": None,
             "error": None,
+            "mqtt_sent": False,
+            "mqtt_sent_at": None,
+            "mqtt_error": None,
         }
 
         updates = {
@@ -749,10 +758,50 @@ class CommandService:
             f"machines/{machine_key}/latest_command_id": command_id,
             f"machines/{machine_key}/latest_command": command,
             f"machines/{machine_key}/latest_command_status": "QUEUED",
+            f"machines/{machine_key}/latest_command_mqtt_sent": False,
             f"machines/{machine_key}/updated_at": timestamp,
         }
 
         get_ref("/").update(updates)
+
+        try:
+            mqtt_sent = publish_machine_command(command_data)
+
+            if mqtt_sent:
+                mqtt_timestamp = now_iso()
+
+                mqtt_updates = {
+                    f"machine_commands/{command_id}/mqtt_sent": True,
+                    f"machine_commands/{command_id}/mqtt_sent_at": mqtt_timestamp,
+                    f"machines/{machine_key}/latest_command_mqtt_sent": True,
+                    f"machines/{machine_key}/latest_command_mqtt_sent_at": mqtt_timestamp,
+                }
+
+                get_ref("/").update(mqtt_updates)
+
+                command_data["mqtt_sent"] = True
+                command_data["mqtt_sent_at"] = mqtt_timestamp
+
+            else:
+                get_ref("/").update({
+                    f"machine_commands/{command_id}/mqtt_sent": False,
+                    f"machines/{machine_key}/latest_command_mqtt_sent": False,
+                })
+
+                command_data["mqtt_sent"] = False
+
+        except Exception as error:
+            print("[MQTT] Command publish failed:", error)
+
+            get_ref("/").update({
+                f"machine_commands/{command_id}/mqtt_sent": False,
+                f"machine_commands/{command_id}/mqtt_error": str(error),
+                f"machines/{machine_key}/latest_command_mqtt_sent": False,
+                f"machines/{machine_key}/latest_command_mqtt_error": str(error),
+            })
+
+            command_data["mqtt_sent"] = False
+            command_data["mqtt_error"] = str(error)
 
         return command_data
 
@@ -793,10 +842,12 @@ class CommandService:
             machine.get("session_duration_ms"),
             duration_minutes * 60 * 1000,
         )
+
         remaining_ms = CommandService._safe_int(
             machine.get("session_remaining_ms"),
             remaining_minutes * 60 * 1000,
         )
+
         elapsed_ms = CommandService._safe_int(
             machine.get("session_elapsed_ms"),
             elapsed_minutes * 60 * 1000,
@@ -921,6 +972,10 @@ class CommandService:
         target_temperature = float(DRYER_DEFAULT_TARGET_TEMPERATURE)
         duration_minutes = int(payload.duration_minutes)
 
+        print("[COMMAND] START_SESSION requested")
+        print("[COMMAND] machine_id:", normalized_machine_id)
+        print("[COMMAND] duration_minutes:", duration_minutes)
+
         if target_temperature < 30 or target_temperature > 120:
             raise HTTPException(
                 status_code=500,
@@ -949,16 +1004,17 @@ class CommandService:
             )
 
         active_session_id = CommandService._create_session_id()
+        duration_ms = duration_minutes * 60 * 1000
 
         command_payload = {
             "sessionId": active_session_id,
             "targetTemperature": target_temperature,
             "durationMinutes": duration_minutes,
-            "durationMs": duration_minutes * 60 * 1000,
+            "durationMs": duration_ms,
             "elapsedMinutes": 0,
             "elapsedMs": 0,
             "remainingMinutes": duration_minutes,
-            "remainingMs": duration_minutes * 60 * 1000,
+            "remainingMs": duration_ms,
         }
 
         command_data = CommandService._create_command_record(
@@ -982,9 +1038,9 @@ class CommandService:
             f"machines/{machine_key}/session_duration_minutes": duration_minutes,
             f"machines/{machine_key}/session_elapsed_minutes": 0,
             f"machines/{machine_key}/session_remaining_minutes": duration_minutes,
-            f"machines/{machine_key}/session_duration_ms": duration_minutes * 60 * 1000,
+            f"machines/{machine_key}/session_duration_ms": duration_ms,
             f"machines/{machine_key}/session_elapsed_ms": 0,
-            f"machines/{machine_key}/session_remaining_ms": duration_minutes * 60 * 1000,
+            f"machines/{machine_key}/session_remaining_ms": duration_ms,
             f"machines/{machine_key}/cycles": existing_cycles,
             f"machines/{machine_key}/cycle_warning": existing_cycles >= 8,
             f"machines/{machine_key}/session_cycle_counted": False,
@@ -1001,9 +1057,9 @@ class CommandService:
             f"devices/{machine_key}/session_duration_minutes": duration_minutes,
             f"devices/{machine_key}/session_elapsed_minutes": 0,
             f"devices/{machine_key}/session_remaining_minutes": duration_minutes,
-            f"devices/{machine_key}/session_duration_ms": duration_minutes * 60 * 1000,
+            f"devices/{machine_key}/session_duration_ms": duration_ms,
             f"devices/{machine_key}/session_elapsed_ms": 0,
-            f"devices/{machine_key}/session_remaining_ms": duration_minutes * 60 * 1000,
+            f"devices/{machine_key}/session_remaining_ms": duration_ms,
             f"devices/{machine_key}/cycles": existing_cycles,
             f"devices/{machine_key}/cycle_warning": existing_cycles >= 8,
             f"devices/{machine_key}/updated_at": timestamp,
@@ -1120,8 +1176,10 @@ class CommandService:
                 final_status="STOPPED",
                 completion_reason="USER_STOPPED",
             )
+
         else:
             timestamp = now_iso()
+
             updates = {
                 f"machines/{machine_key}/latest_status": "STOPPING",
                 f"machines/{machine_key}/session_active": False,

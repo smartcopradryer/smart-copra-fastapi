@@ -16,6 +16,7 @@ from config import (
     now_iso,
 )
 from services import ws_manager
+from mqtt_service import mqtt_publisher
 
 
 app = FastAPI(
@@ -45,9 +46,21 @@ async def startup():
     except Exception as error:
         print("[FIREBASE] Initialization failed:", error)
 
+    try:
+        mqtt_publisher.start()
+
+    except Exception as error:
+        print("[MQTT] Startup failed:", error)
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        mqtt_publisher.stop()
+
+    except Exception as error:
+        print("[MQTT] Shutdown failed:", error)
+
     print("[FIREBASE] Shutdown complete")
 
 
